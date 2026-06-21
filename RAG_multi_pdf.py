@@ -5,7 +5,7 @@ import fitz
 
 documents  = []
 
-folder_path = r"C:\Users\Madhav\NLP\pdfs"
+folder_path = r"C:\Users\Madhav\OneDrive\PROJECTS\Python_Project1\RAG_Implementation\pdfs"
 
 for filename in os.listdir(folder_path):
     if filename.endswith(".pdf"):
@@ -21,7 +21,7 @@ for filename in os.listdir(folder_path):
 
         pdf.close()
 
-pages = []
+# pages = []
 
 # CREATING CHUNKS
 # fixed chunking method
@@ -57,6 +57,16 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 embeddings = model.encode(
     [item["text"] for item in chunk_data]
 )
+# build BM25 index
+from rank_bm25 import BM25Okapi
+
+tokenized_chunks = [
+    item["text"].lower().split()
+    for item in chunk_data 
+]
+#keyword search index
+bm25 =BM25Okapi(tokenized_chunks)
+
 
 # BRUTE FORCE METHOD
 # storing the chunks and embeddings 
@@ -82,7 +92,28 @@ index.add(embeddings)
 from sentence_transformers import CrossEncoder
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# retrieval part
+
+    #Retrieval part of bm25
+def bm25_retrieve(
+        query,
+        top_k = 20
+):
+    query_tokens=(
+        query.lower().split()
+    )
+    scores = bm25.get_scores(
+        query_tokens
+    )
+
+    top_indices = (
+        np.argsort(scores)
+        [-top_k:]
+        [::-1]
+    )
+
+    return top_indices
+
+# retrieval part of Hybrid Search ( bm25 + faiss)
 def retrieve(query,
             top_k = 20,
             source =None):
@@ -95,31 +126,39 @@ def retrieve(query,
     )
 
     faiss.normalize_L2(query_embedding)
- 
-    scores ,indices = index.search(
+    
+    faiss_scores ,faiss_indices = index.search(
         query_embedding,
         top_k
     )
 
-    if scores[0][0]<0.15:
+    bm_indices = bm25_retrieve(query,
+                           top_k)
+
+    # hybrid search 
+    candidate_indices = list(
+    set(
+        faiss_indices[0].tolist()
+        +
+        bm_indices.tolist()
+    ))
+
+    if len(candidate_indices) == 0:
         return None
     
-    print("\nTop Retrieved Chunks: ")
-    for score ,idx in zip(
-        scores[0],
-        indices[0]
-        ):
-        print(f"\nScore : {score :.4f}")
-        print(f"Page: {chunk_data[idx]['source']}")
-        print(chunk_data[idx]["page"])
+    print("\nCombined Candidates: ")
+    for idx in candidate_indices:
+        print(
+            chunk_data[idx]['source'],
+            chunk_data[idx]["page"]
+        )
 
     return [
         chunk_data[i]
-        for i in indices[0]
+        for i in candidate_indices
     ]
 
-            #    // GENERATION CODE //
-
+    #    // GENERATION CODE //
 
 import requests
 while True:
@@ -134,9 +173,15 @@ while True:
     retrieved_chunks= retrieve(
         question,
         top_k=20)
+    
+    if retrieved_chunks is None:
+        print("I couldn't find relevant information in the PDF.")
+        continue
 
     pairs =[
-        (question , chunk["text"])
+        (question,
+         chunk["text"]
+        )
         for chunk in retrieved_chunks 
     ]
 
@@ -157,9 +202,6 @@ while True:
         for chunk in top_chunks
     )
     
-    if retrieved_chunks is None:
-        print("I couldn't find relevant information in the PDF.")
-        continue
     prompt = f"""
     
    You are a resume question-answering assistant.
@@ -208,7 +250,7 @@ while True:
 
     print("\n Sources : ")
 
-    for item in retrieved_chunks:
+    for item in top_chunks:
         print(
-            f" {item["source"]} | Page {item['page']}"
+            f"{item["source"]} | Page {item['page']}"
         )
