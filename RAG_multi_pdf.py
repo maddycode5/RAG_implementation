@@ -18,8 +18,23 @@ for filename in os.listdir(folder_path):
                 "page" : page_num + 1,
                 "source" : filename
             })
-
+    
         pdf.close()
+
+document_texts = {}
+
+for doc in documents:
+    source = doc["source"]
+
+    if source not in document_texts:          
+        document_texts[source] = ""
+            
+    document_texts[source] += "\n" + doc["text"]
+
+# create document name list
+doc_names =list(
+    document_texts.keys()
+)
 
 # pages = []
 
@@ -54,9 +69,21 @@ for doc in documents:
 # generate emebddings 
 from sentence_transformers import SentenceTransformer 
 model = SentenceTransformer("all-MiniLM-L6-v2")
+
 embeddings = model.encode(
     [item["text"] for item in chunk_data]
 )
+# document embeddings
+doc_embeddings = model.encode(
+    list(document_texts.values())
+)
+import numpy as np 
+import faiss
+
+# convert to numpy
+doc_embeddings = np.array(doc_embeddings,
+                          dtype = np.float32)
+
 # build BM25 index
 from rank_bm25 import BM25Okapi
 
@@ -75,23 +102,24 @@ bm25 =BM25Okapi(tokenized_chunks)
 #     "embeddings" : embeddings
 # } 
 
-import numpy as np 
-import faiss
-
 embeddings = np.array(embeddings , dtype=np.float32)
 
 faiss.normalize_L2(embeddings)
+faiss.normalize_L2(doc_embeddings)
 
 dimension = embeddings.shape[1]
 # this FAISS returns cosine similarity scores 
 index= faiss.IndexFlatIP(dimension)
-
 index.add(embeddings)
+
+# document FAISS Index
+doc_dimension = doc_embeddings.shape[1]
+doc_index = faiss.IndexFlatIP(doc_dimension)
+doc_index.add(doc_embeddings)
 
 
 from sentence_transformers import CrossEncoder
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
 
     #Retrieval part of bm25
 def bm25_retrieve(
@@ -113,10 +141,40 @@ def bm25_retrieve(
 
     return top_indices
 
+def retrieve_documents(
+        query,
+        top_docs=3
+):
+    query_embedding = model.encode([query])
+
+    query_embedding = np.array(
+        query_embedding,
+        dtype = np.float32
+    )
+
+    faiss.normalize_L2(query_embedding)
+
+
+    scores,indices = doc_index.search(query_embedding ,
+                                      top_docs)
+    
+    print("\nTop Documents: ")
+
+    for score,idx in zip(scores[0],
+                        indices[0]):
+        print(
+            f"{doc_names[idx]}  (score={score:.4f})"
+            )
+        
+    return [
+        doc_names[i]
+        for i in indices[0]     
+        ]
+        
 # retrieval part of Hybrid Search ( bm25 + faiss)
 def retrieve(query,
             top_k = 20,
-            source =None):
+            sources = None):
     
     query_embedding = model.encode([query])
 
@@ -127,25 +185,48 @@ def retrieve(query,
 
     faiss.normalize_L2(query_embedding)
     
-    faiss_scores ,faiss_indices = index.search(
+    # document filtering 
+    candidate_chunk_indices = {
+        i
+        for i, chunk in enumerate(chunk_data)
+        if sources is None or chunk["source"] in sources
+    }
+    # faiss retrieval
+    faiss_scores, faiss_indices = index.search(
         query_embedding,
-        top_k
+        100
     )
 
-    bm_indices = bm25_retrieve(query,
-                           top_k)
+    filtered_faiss = []
 
-    # hybrid search 
+    for idx in faiss_indices[0]:
+        if idx in candidate_chunk_indices:
+            filtered_faiss.append(idx)
+
+    filtered_faiss = filtered_faiss[:top_k]
+
+    # BM25 retrieval
+    bm_indices = [
+        idx
+        for idx in bm25_retrieve(query, top_k * 3)
+        if idx in candidate_chunk_indices
+    ][:top_k]
+
+
+    # hybrid merge 
     candidate_indices = list(
     set(
-        faiss_indices[0].tolist()
+        filtered_faiss
         +
-        bm_indices.tolist()
+        bm_indices
     ))
-
+    
     if len(candidate_indices) == 0:
         return None
     
+    print("\nTop    Documents: ")
+    print(sources)
+
     print("\nCombined Candidates: ")
     for idx in candidate_indices:
         print(
@@ -170,9 +251,14 @@ while True:
     # context = "\n".join(retrieved_chunks)
     # won't work because now retrieved chunks are dictionaries.
 
-    retrieved_chunks= retrieve(
+    top_docs = retrieve_documents(
         question,
-        top_k=20)
+        top_docs=3)
+    
+    retrieved_chunks = retrieve(question,
+                                top_k =20,
+                                sources = top_docs
+                                )
     
     if retrieved_chunks is None:
         print("I couldn't find relevant information in the PDF.")
@@ -252,5 +338,5 @@ while True:
 
     for item in top_chunks:
         print(
-            f"{item["source"]} | Page {item['page']}"
+            f"{item['source']} | Page {item['page']}"
         )
